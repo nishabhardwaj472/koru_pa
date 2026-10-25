@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
@@ -40,6 +41,23 @@ import {
   sendCaregiverAlert,
   type Caregiver,
 } from "@/services/caregiverApi";
+import {
+  BUILT_IN_TONES,
+  type BuiltInToneId,
+  type AlarmSoundConfig,
+  getAlarmSoundPreference,
+  saveAlarmSoundPreference,
+  saveCustomAudio,
+  getCustomAudio,
+  playAlarmSound,
+  stopAlarmSound,
+} from "@/services/alarmAudio";
+import {
+  syncDoseToBackend,
+  markDoseTakenOnBackend,
+  fetchEmailConfigStatus,
+  type EmailConfigStatus,
+} from "@/services/reminderNotificationApi";
 
 interface KoruAppProps {
   userId: string;
@@ -166,6 +184,151 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
   const [medicineLookup, setMedicineLookup] = useState("");
   const [medicineInfo, setMedicineInfo] = useState("");
 
+  // Alarm sound configuration and state
+  const [alarmPref, setAlarmPref] = useState<AlarmSoundConfig>(() => getAlarmSoundPreference(userId));
+  const [customAudioInfo, setCustomAudioInfo] = useState<{ name: string; size: number } | null>(null);
+  const [previewingTone, setPreviewingTone] = useState<string | null>(null);
+  const [isAlarmPlaying, setIsAlarmPlaying] = useState(false);
+  const [isAlarmSilentInterval, setIsAlarmSilentInterval] = useState(false);
+  const [activeAlarmReminder, setActiveAlarmReminder] = useState<Reminder | null>(null);
+  const silencedReminderIdsRef = useRef<Set<string>>(new Set());
+  const isAudioPlayingRef = useRef(false);
+  const [emailConfigStatus, setEmailConfigStatus] = useState<EmailConfigStatus | null>(null);
+
+  // Check backend email configuration status on mount
+  useEffect(() => {
+    void fetchEmailConfigStatus().then((status) => {
+      setEmailConfigStatus(status);
+      if (status && !status.configured) {
+        console.info("[Koru] Caregiver email notification status:", status.details);
+      }
+    });
+  }, []);
+
+  // Load custom audio & preference when user changes
+  useEffect(() => {
+    const pref = getAlarmSoundPreference(userId);
+    setAlarmPref(pref);
+    void getCustomAudio(userId).then((custom) => {
+      if (custom) {
+        setCustomAudioInfo({ name: custom.name, size: custom.blob.size });
+      } else {
+        setCustomAudioInfo(null);
+        if (pref.type === "custom") {
+          const fallback: AlarmSoundConfig = { type: "builtin", builtinId: "gentle" };
+          setAlarmPref(fallback);
+          saveAlarmSoundPreference(userId, fallback);
+          toast({
+            title: "Custom sound unavailable",
+            description: "Previously saved custom audio could not be restored from browser storage. Defaulting to Gentle Chime.",
+          });
+        }
+      }
+    });
+  }, [userId]);
+
+  const stopAlarm = useCallback(() => {
+    stopAlarmSound();
+    isAudioPlayingRef.current = false;
+    setIsAlarmPlaying(false);
+    setIsAlarmSilentInterval(false);
+    setActiveAlarmReminder(null);
+    setPreviewingTone(null);
+  }, []);
+
+  const startAlarm = useCallback(async (reminder?: Reminder) => {
+    setIsAlarmPlaying(true);
+    if (reminder) setActiveAlarmReminder(reminder);
+    setPreviewingTone(null);
+    if (!isAudioPlayingRef.current) {
+      isAudioPlayingRef.current = true;
+      try {
+        await playAlarmSound(alarmPref, userId);
+      } catch (err) {
+        console.error("Failed to play alarm:", err);
+      }
+    }
+  }, [alarmPref, userId]);
+
+  const handlePreviewTone = useCallback(async (toneId: BuiltInToneId) => {
+    if (previewingTone === toneId) {
+      stopAlarm();
+      return;
+    }
+    stopAlarm();
+    setPreviewingTone(toneId);
+    try {
+      await playAlarmSound({ type: "builtin", builtinId: toneId }, userId, {
+        isPreview: true,
+        onEnd: () => setPreviewingTone(null),
+      });
+    } catch {
+      setPreviewingTone(null);
+    }
+  }, [previewingTone, stopAlarm, userId]);
+
+  const handlePreviewCustom = useCallback(async () => {
+    if (previewingTone === "custom") {
+      stopAlarm();
+      return;
+    }
+    stopAlarm();
+    setPreviewingTone("custom");
+    try {
+      await playAlarmSound({ type: "custom", builtinId: "gentle" }, userId, {
+        isPreview: true,
+        onEnd: () => setPreviewingTone(null),
+      });
+    } catch {
+      setPreviewingTone(null);
+    }
+  }, [previewingTone, stopAlarm, userId]);
+
+  const handleSelectTone = (toneId: BuiltInToneId) => {
+    stopAlarm();
+    const newPref: AlarmSoundConfig = { type: "builtin", builtinId: toneId };
+    setAlarmPref(newPref);
+    saveAlarmSoundPreference(userId, newPref);
+    const toneName = BUILT_IN_TONES.find((t) => t.id === toneId)?.name ?? toneId;
+    toast({ title: "Alarm tone updated", description: `Selected: ${toneName}` });
+  };
+
+  const handleSelectCustom = () => {
+    if (!customAudioInfo) {
+      toast({ title: "No custom sound", description: "Please upload an audio file first.", variant: "destructive" });
+      return;
+    }
+    stopAlarm();
+    const newPref: AlarmSoundConfig = { type: "custom", builtinId: "gentle", customName: customAudioInfo.name };
+    setAlarmPref(newPref);
+    saveAlarmSoundPreference(userId, newPref);
+    toast({ title: "Custom sound applied", description: `Now using ${customAudioInfo.name} for alarms.` });
+  };
+
+  const handleCustomFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const result = await saveCustomAudio(userId, file);
+    if (!result.success) {
+      toast({
+        title: "Audio upload failed",
+        description: result.error || "Could not save custom audio.",
+        variant: "destructive",
+      });
+      return;
+    }
+    stopAlarm();
+    setCustomAudioInfo({ name: file.name, size: file.size });
+    const newPref: AlarmSoundConfig = { type: "custom", builtinId: "gentle", customName: file.name };
+    setAlarmPref(newPref);
+    saveAlarmSoundPreference(userId, newPref);
+    toast({
+      title: "Custom alarm sound saved",
+      description: `${file.name} is now your active medication alarm.`,
+    });
+    e.target.value = "";
+  };
+
   // Auto-scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -198,6 +361,82 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
     return new Date(`${r.scheduled_date}T${r.scheduled_time}`).getTime() >= Date.now();
   }), [reminders]);
 
+  // Effect to manage the 2-min ringing, 1-min silent, 10-min window alarm cycle
+  useEffect(() => {
+    const check = () => {
+      const now = new Date();
+      const today = todayISO();
+
+      // Find any reminder for today that is pending or snoozed and due
+      const due = reminders.find((r) => {
+        if (r.status !== "pending" && r.status !== "snoozed") return false;
+        if (r.scheduled_date !== today) return false;
+        if (silencedReminderIdsRef.current.has(r.id)) return false;
+
+        const reminderTime = new Date(`${r.scheduled_date}T${r.scheduled_time}`);
+        const elapsedMs = now.getTime() - reminderTime.getTime();
+
+        // If 10 minutes have elapsed from scheduled time, permanently stop alarm for that reminder
+        if (elapsedMs >= 10 * 60 * 1000) {
+          silencedReminderIdsRef.current.add(r.id);
+          if (activeAlarmReminder?.id === r.id) {
+            stopAlarm();
+          }
+          return false;
+        }
+
+        // Due within the active 10-minute window [0, 10 min)
+        return elapsedMs >= 0;
+      });
+
+      if (!due) {
+        if (isAlarmPlaying) {
+          stopAlarm();
+        }
+        return;
+      }
+
+      // Sync dose to backend so backend tracks the 30-minute caregiver notification schedule
+      const med = medications.find((m) => m.id === due.medication_id);
+      void syncDoseToBackend({
+        reminderId: due.id,
+        medicationName: med?.name || "Scheduled Medication",
+        dosage: med?.dosage || "",
+        scheduledDate: due.scheduled_date,
+        scheduledTime: due.scheduled_time,
+        status: due.status,
+      });
+
+      // Calculate timing within the 10-minute window:
+      // Repeating cycle: 2 minutes (120,000 ms) ringing, 1 minute (60,000 ms) silent
+      const reminderTime = new Date(`${due.scheduled_date}T${due.scheduled_time}`);
+      const elapsedMs = now.getTime() - reminderTime.getTime();
+      const cycleElapsedMs = elapsedMs % (3 * 60 * 1000);
+      const shouldRing = cycleElapsedMs < 2 * 60 * 1000;
+
+      setIsAlarmPlaying(true);
+      setActiveAlarmReminder(due);
+
+      if (shouldRing) {
+        setIsAlarmSilentInterval(false);
+        if (!isAudioPlayingRef.current) {
+          isAudioPlayingRef.current = true;
+          void playAlarmSound(alarmPref, userId);
+        }
+      } else {
+        // 1-minute silent interval
+        setIsAlarmSilentInterval(true);
+        if (isAudioPlayingRef.current) {
+          isAudioPlayingRef.current = false;
+          stopAlarmSound();
+        }
+      }
+    };
+
+    const intervalId = setInterval(check, 1000);
+    return () => clearInterval(intervalId);
+  }, [reminders, isAlarmPlaying, activeAlarmReminder, alarmPref, userId, stopAlarm, medications]);
+
   const weeklyScore = useMemo(() => {
     const sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
     const weekReminders = reminders.filter((r) => new Date(r.scheduled_date) >= sevenDaysAgo);
@@ -216,15 +455,63 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
     setLogs(logsData);
   }, [userId]);
 
-  const updateReminderStatus = useCallback(async (reminder: Reminder, status: "taken" | "missed" | "snoozed") => {
+  const updateReminderStatus = useCallback(async (reminder: Reminder, status: "taken" | "snoozed") => {
+    // 1. Immediately stop alarm sound and reset alarm state
+    stopAlarm();
+    silencedReminderIdsRef.current.add(reminder.id);
+
     try {
-      await updateReminder(userId, reminder.id, { status, taken_at: status === "taken" ? new Date().toISOString() : null });
+      let patch: Partial<Reminder> = {
+        status,
+        taken_at: status === "taken" ? new Date().toISOString() : null,
+      };
+
+      if (status === "taken") {
+        // Cancel all remaining alarm cycles and any pending caregiver email reminders for that dose
+        await markDoseTakenOnBackend(reminder.id, reminder.scheduled_date);
+      } else if (status === "snoozed") {
+        // Schedule the SAME reminder for the snooze interval (10 minutes) without creating duplicates
+        const snoozeTime = new Date(Date.now() + 10 * 60 * 1000);
+        const yyyy = snoozeTime.getFullYear();
+        const mm = String(snoozeTime.getMonth() + 1).padStart(2, "0");
+        const dd = String(snoozeTime.getDate()).padStart(2, "0");
+        const hh = String(snoozeTime.getHours()).padStart(2, "0");
+        const min = String(snoozeTime.getMinutes()).padStart(2, "0");
+        patch = {
+          status: "snoozed",
+          scheduled_date: `${yyyy}-${mm}-${dd}`,
+          scheduled_time: `${hh}:${min}`,
+          taken_at: null,
+        };
+      }
+
+      await updateReminder(userId, reminder.id, patch);
       await createLog(userId, { medication_id: reminder.medication_id, action: status });
       await refreshRemindersAndLogs();
+
+      if (status === "snoozed") {
+        // Reset silenced ID so that when the new scheduled time (10 min later) arrives,
+        // it triggers again and resets the alarm cycle for the snoozed occurrence
+        silencedReminderIdsRef.current.delete(reminder.id);
+
+        const med = medications.find((m) => m.id === reminder.medication_id);
+        await syncDoseToBackend({
+          reminderId: reminder.id,
+          medicationName: med?.name || "Scheduled Medication",
+          dosage: med?.dosage || "",
+          scheduledDate: patch.scheduled_date!,
+          scheduledTime: patch.scheduled_time!,
+          status: "snoozed",
+        });
+
+        toast({ title: "Alarm snoozed", description: `Rescheduled for 10 minutes (${patch.scheduled_time}).` });
+      } else if (status === "taken") {
+        toast({ title: "Medication taken", description: "Recorded. Caregiver notifications canceled for this dose." });
+      }
     } catch (err) {
       toast({ title: "Update failed", description: err instanceof Error ? err.message : "Try again", variant: "destructive" });
     }
-  }, [refreshRemindersAndLogs, userId]);
+  }, [refreshRemindersAndLogs, userId, stopAlarm, medications]);
 
   const handleMedicationCreate = async (formData: FormData) => {
     try {
@@ -243,11 +530,26 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
 
   const handleReminderCreate = async (formData: FormData) => {
     try {
-      await createReminder(userId, {
-        medication_id: String(formData.get("medication_id") ?? ""),
-        scheduled_date: String(formData.get("scheduled_date") ?? ""),
-        scheduled_time: String(formData.get("scheduled_time") ?? ""),
+      const scheduled_date = String(formData.get("scheduled_date") ?? "");
+      const scheduled_time = String(formData.get("scheduled_time") ?? "");
+      const medication_id = String(formData.get("medication_id") ?? "");
+
+      const created = await createReminder(userId, {
+        medication_id,
+        scheduled_date,
+        scheduled_time,
       });
+
+      const med = medications.find((m) => m.id === medication_id);
+      void syncDoseToBackend({
+        reminderId: created.id,
+        medicationName: med?.name || "Scheduled Medication",
+        dosage: med?.dosage || "",
+        scheduledDate: scheduled_date,
+        scheduledTime: scheduled_time,
+        status: "pending",
+      });
+
       toast({ title: "Reminder created" });
       await refreshRemindersAndLogs();
     } catch (err) {
@@ -261,6 +563,7 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
         name: String(formData.get("name") ?? ""),
         phone: String(formData.get("phone") ?? ""),
         email: String(formData.get("email") ?? ""),
+        relationship: String(formData.get("relationship") ?? "").trim().toLowerCase() || "loved one",
       };
       
       if (editingCaregiver) {
@@ -354,6 +657,8 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
       window.speechSynthesis.speak(utterance);
     }, 50);
   };
+
+
 
   const stopSpeaking = () => {
     if ("speechSynthesis" in window) {
@@ -501,6 +806,60 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
       </header>
 
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6">
+        {/* Active Medication Alarm Ringing Banner */}
+        {isAlarmPlaying && activeAlarmReminder && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.98, y: -10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            className={`flex flex-wrap items-center justify-between gap-4 rounded-2xl border-2 p-4 shadow-xl backdrop-blur-xl transition-all ${
+              isAlarmSilentInterval
+                ? "border-warning/60 bg-warning/10 shadow-warning/10"
+                : "border-primary bg-primary/10 shadow-primary/20"
+            }`}
+          >
+            <div className="flex items-center gap-3.5">
+              <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl text-primary-foreground shadow-md ${
+                isAlarmSilentInterval ? "bg-warning text-warning-foreground" : "gradient-primary"
+              }`}>
+                <Volume2 className={`h-6 w-6 ${isAlarmSilentInterval ? "opacity-60" : "animate-pulse"}`} />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className={`flex h-2.5 w-2.5 rounded-full ${
+                    isAlarmSilentInterval ? "bg-amber-500" : "bg-red-500 animate-ping"
+                  }`} />
+                  <p className="font-display font-bold text-foreground text-lg">
+                    {isAlarmSilentInterval
+                      ? "Medication Reminder Due (1 min pause)"
+                      : "Medication Reminder Alarm Ringing!"}
+                  </p>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  {medications.find((m) => m.id === activeAlarmReminder.medication_id)?.name ?? "Medication"} at {activeAlarmReminder.scheduled_time}
+                  {isAlarmSilentInterval ? " • Ringing will resume in a moment" : " • 2 min ringing cycle"}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                className="rounded-xl gradient-primary text-primary-foreground font-semibold shadow-md"
+                onClick={() => void updateReminderStatus(activeAlarmReminder, "taken")}
+              >
+                ✓ Taken
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="rounded-xl font-semibold shadow-sm"
+                onClick={() => void updateReminderStatus(activeAlarmReminder, "snoozed")}
+              >
+                Snooze (10m)
+              </Button>
+            </div>
+          </motion.div>
+        )}
+
         {/* Alert Banner */}
         {missedCount >= 2 && caregivers.some((c) => c.notify_on_missed) && (
           <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="flex items-center gap-3 rounded-2xl border border-destructive/30 bg-destructive/8 p-4 glass-card">
@@ -715,6 +1074,145 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
                   </CardContent>
                 </Card>
 
+                {/* Alarm Sound Customization */}
+                <Card className="rounded-2xl glass-card border-border/40">
+                  <CardHeader>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <CardTitle className="flex items-center gap-2 font-display text-xl">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-lg feature-icon-bg">
+                          <Volume2 className="h-4 w-4 text-primary" />
+                        </div>
+                        Alarm Tone Settings
+                      </CardTitle>
+                      <span className="text-xs px-3 py-1 rounded-full bg-primary/10 text-primary font-medium">
+                        Active: {alarmPref.type === "custom" ? (alarmPref.customName || "Custom Sound") : (BUILT_IN_TONES.find((t) => t.id === alarmPref.builtinId)?.name ?? "Gentle Chime")}
+                      </span>
+                    </div>
+                    <CardDescription>
+                      Choose from 5 built-in alarm tones or upload a custom audio file from your device.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-6">
+                    {/* 1. Built-in Alarm Sounds */}
+                    <div>
+                      <h4 className="text-sm font-semibold text-foreground mb-3 flex items-center gap-1.5">
+                        <Sparkles className="h-4 w-4 text-primary" /> Built-in Alarm Tones
+                      </h4>
+                      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        {BUILT_IN_TONES.map((tone) => {
+                          const isSelected = alarmPref.type === "builtin" && alarmPref.builtinId === tone.id;
+                          const isPreviewing = previewingTone === tone.id;
+                          return (
+                            <div
+                              key={tone.id}
+                              className={`flex items-center justify-between p-3.5 rounded-xl border transition-all ${
+                                isSelected
+                                  ? "border-primary/50 bg-primary/10 shadow-sm"
+                                  : "border-border/40 bg-card/40 hover:bg-card/70"
+                              }`}
+                            >
+                              <div className="min-w-0 pr-2">
+                                <div className="flex items-center gap-2">
+                                  <p className="font-semibold text-sm truncate">{tone.name}</p>
+                                  {isSelected && (
+                                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-primary text-primary-foreground">
+                                      Active
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-xs text-muted-foreground truncate">{tone.description}</p>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <Button
+                                  size="sm"
+                                  variant={isPreviewing ? "default" : "outline"}
+                                  className="h-8 px-2.5 rounded-lg text-xs"
+                                  onClick={() => void handlePreviewTone(tone.id)}
+                                  title={isPreviewing ? "Stop Preview" : "Preview Sound"}
+                                >
+                                  {isPreviewing ? <Square className="h-3.5 w-3.5 mr-1" /> : <Volume2 className="h-3.5 w-3.5 mr-1" />}
+                                  {isPreviewing ? "Stop" : "Test"}
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant={isSelected ? "secondary" : "ghost"}
+                                  className={`h-8 px-2.5 rounded-lg text-xs ${isSelected ? "font-bold text-primary" : ""}`}
+                                  onClick={() => handleSelectTone(tone.id)}
+                                  disabled={isSelected}
+                                >
+                                  {isSelected ? "Selected" : "Select"}
+                                </Button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* 2. Custom Sound from User's Device */}
+                    <div className="pt-2 border-t border-border/40">
+                      <h4 className="text-sm font-semibold text-foreground mb-3 flex items-center gap-1.5">
+                        <Upload className="h-4 w-4 text-primary" /> Custom Device Audio
+                      </h4>
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 p-4 rounded-xl border border-border/40 bg-card/40">
+                        <div className="space-y-1">
+                          <p className="text-sm font-medium text-foreground">
+                            {customAudioInfo ? customAudioInfo.name : "No custom audio file selected"}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            {customAudioInfo
+                              ? `Saved locally in browser (${(customAudioInfo.size / 1024).toFixed(0)} KB). Stored strictly on device.`
+                              : "Upload an MP3, WAV, or OGG file (max 5 MB). Stored locally in your browser."}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {customAudioInfo && (
+                            <>
+                              <Button
+                                size="sm"
+                                variant={previewingTone === "custom" ? "default" : "outline"}
+                                className="h-9 px-3 rounded-xl text-xs"
+                                onClick={() => void handlePreviewCustom()}
+                              >
+                                {previewingTone === "custom" ? (
+                                  <>
+                                    <Square className="h-3.5 w-3.5 mr-1.5" /> Stop
+                                  </>
+                                ) : (
+                                  <>
+                                    <Volume2 className="h-3.5 w-3.5 mr-1.5" /> Preview
+                                  </>
+                                )}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant={alarmPref.type === "custom" ? "secondary" : "default"}
+                                className="h-9 px-3 rounded-xl text-xs"
+                                onClick={handleSelectCustom}
+                                disabled={alarmPref.type === "custom"}
+                              >
+                                {alarmPref.type === "custom" ? "Active Sound" : "Use As Alarm"}
+                              </Button>
+                            </>
+                          )}
+                          <label className="cursor-pointer">
+                            <input
+                              type="file"
+                              accept="audio/mp3,audio/wav,audio/ogg,audio/mpeg,.mp3,.wav,.ogg"
+                              className="hidden"
+                              onChange={(e) => void handleCustomFileUpload(e)}
+                            />
+                            <div className="inline-flex h-9 items-center justify-center rounded-xl bg-primary/10 hover:bg-primary/20 text-primary px-3 text-xs font-semibold transition-colors border border-primary/20">
+                              <Upload className="h-3.5 w-3.5 mr-1.5" />
+                              {customAudioInfo ? "Replace Audio" : "Upload Sound"}
+                            </div>
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+
                 <Card className="rounded-2xl glass-card border-border/40">
                   <CardHeader><CardTitle className="font-display text-xl">Medication Schedule</CardTitle></CardHeader>
                   <CardContent className="space-y-3">
@@ -732,7 +1230,6 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
                         <div className="flex gap-2">
                           <Button size="sm" className="rounded-xl gradient-primary text-primary-foreground" onClick={() => void updateReminderStatus(r, "taken")}>Taken</Button>
                           <Button size="sm" variant="secondary" className="rounded-xl" onClick={() => void updateReminderStatus(r, "snoozed")}>Snooze</Button>
-                          <Button size="sm" variant="destructive" className="rounded-xl" onClick={() => void updateReminderStatus(r, "missed")}>Missed</Button>
                         </div>
                       </div>
                     ))}
@@ -851,6 +1348,17 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
             {activePage === "caregiver" && (
               <div className="space-y-6">
                 <h2 className="font-display text-2xl font-bold">Caregiver Management</h2>
+                {emailConfigStatus && !emailConfigStatus.configured && (
+                  <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-700 dark:text-amber-300">
+                    <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-semibold">Caregiver Email Service Unconfigured</p>
+                      <p className="mt-0.5 opacity-90">
+                        Automated 30-minute reminder emails require email credentials. Please add RESEND_API_KEY or EMAIL_USER and EMAIL_PASS in backend/.env.
+                      </p>
+                    </div>
+                  </div>
+                )}
                 <Card className="rounded-2xl glass-card border-border/40">
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2 font-display text-xl">
@@ -865,6 +1373,7 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
                       <Input name="name" placeholder="Name" defaultValue={editingCaregiver?.name || ""} required className="h-12 text-base rounded-xl" />
                       <Input name="phone" placeholder="Phone" defaultValue={editingCaregiver?.phone || ""} required className="h-12 text-base rounded-xl" />
                       <Input name="email" placeholder="Email" type="email" defaultValue={editingCaregiver?.email || ""} required className="h-12 text-base rounded-xl" />
+                      <Input name="relationship" placeholder="Relationship (e.g. father, mother)" defaultValue={editingCaregiver?.relationship || ""} className="h-12 text-base rounded-xl" />
                       
                       <div className="sm:col-span-2 lg:col-span-4 flex flex-col gap-2">
                         <Button 
@@ -900,7 +1409,14 @@ export const KoruApp = ({ userId, onSignOut }: KoruAppProps) => {
                           <Users className="h-5 w-5 text-primary" />
                         </div>
                         <div className="flex-1">
-                          <p className="font-semibold">{c.name}</p>
+                          <div className="flex items-center gap-2">
+                            <p className="font-semibold">{c.name}</p>
+                            {c.relationship && (
+                              <Badge variant="outline" className="text-xs font-normal capitalize">
+                                {c.relationship}
+                              </Badge>
+                            )}
+                          </div>
                           <p className="text-sm text-muted-foreground">{c.phone} • {c.email}</p>
                         </div>
                         <div className="flex gap-2">

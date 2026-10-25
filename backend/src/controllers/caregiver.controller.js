@@ -7,7 +7,7 @@ import nodemailer from "nodemailer";
 export const addCaregiver = async (req, res) => {
   try {
     const userId = req.user._id;
-    const { name, phone, email } = req.body;
+    const { name, phone, email, relationship } = req.body;
 
     if (!name || !phone || !email) {
       return res.status(400).json({ error: "Name, phone, and email are required" });
@@ -19,7 +19,13 @@ export const addCaregiver = async (req, res) => {
       return res.status(400).json({ error: "You can only add up to 2 caregivers" });
     }
 
-    const caregiver = await Caregiver.create({ userId, name, phone, email });
+    const caregiver = await Caregiver.create({
+      userId,
+      name,
+      phone,
+      email,
+      relationship: relationship ? String(relationship).trim().toLowerCase() : "loved one",
+    });
 
     res.status(201).json(caregiver);
   } catch (error) {
@@ -49,12 +55,17 @@ export const updateCaregiver = async (req, res) => {
   try {
     const userId = req.user._id;
     const { id } = req.params;
-    const { name, phone, email } = req.body;
+    const { name, phone, email, relationship } = req.body;
+
+    const updateData = { name, phone, email };
+    if (relationship !== undefined) {
+      updateData.relationship = String(relationship).trim().toLowerCase() || "loved one";
+    }
 
     // Only update the caregiver if it belongs to this user
     const caregiver = await Caregiver.findOneAndUpdate(
       { _id: id, userId },
-      { name, phone, email },
+      updateData,
       { new: true, runValidators: true }
     );
 

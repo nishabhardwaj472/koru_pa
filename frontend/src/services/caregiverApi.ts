@@ -8,6 +8,7 @@ export interface Caregiver {
   name: string;
   phone: string;
   email: string;
+  relationship?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -17,6 +18,7 @@ export const addCaregiver = async (caregiverData: {
   name: string;
   phone: string;
   email: string;
+  relationship?: string;
 }): Promise<Caregiver> => {
   const response = await fetch(BACKEND_URL, {
     method: "POST",
@@ -53,7 +55,7 @@ export const getCaregivers = async (): Promise<Caregiver[]> => {
 // ── Update an existing caregiver ─────────────────────────────────────────────
 export const updateCaregiver = async (
   id: string,
-  caregiverData: { name: string; phone: string; email: string },
+  caregiverData: { name: string; phone: string; email: string; relationship?: string },
 ): Promise<Caregiver> => {
   const response = await fetch(`${BACKEND_URL}/${id}`, {
     method: "PUT",

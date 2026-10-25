@@ -11,6 +11,9 @@
 export const API_BASE_URL: string =
   (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
 
+// Backend URL for services (default to localhost:5000 if not set)
+export const BACKEND_URL: string = API_BASE_URL || "http://localhost:5000";
+
 // ---------- Types ----------
 export interface Profile {
   id: string;
@@ -231,7 +234,7 @@ export async function createLog(
 }
 
 // ---------- Real Backend Integration ----------
-const BACKEND_URL = "http://localhost:5000";
+
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -282,12 +285,15 @@ export async function sendMessage(message: string): Promise<{ response: string; 
       },
       body: JSON.stringify({ message }),
     });
-
+    console.log('[sendMessage] response status', response.status, response.ok);
     if (!response.ok) {
+        const errBody = await response.text();
+        console.error('[sendMessage] error body', errBody);
         throw new Error(`Failed to send message: ${response.statusText}`);
     }
 
     const data = await response.json();
+    console.log('[sendMessage] response data', data);
     
     // Try to detect the language of the prompt to respond in the correct TTS language
     const detectLang = (text: string): "hi" | "en" => {

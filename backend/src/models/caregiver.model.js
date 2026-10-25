@@ -19,6 +19,11 @@ const caregiverSchema = new mongoose.Schema(
       type: String,
       required: [true, "Email is required"],
     },
+    relationship: {
+      type: String,
+      default: "loved one",
+      trim: true,
+    },
   },
   {
     timestamps: true,

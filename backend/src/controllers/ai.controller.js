@@ -6,33 +6,28 @@ import Chat from "../models/chat.model.js";
 // but since the file is loaded at startup when env vars might not
 // be fully populated yet, we can instantiate it lazily or just 
 // use a getter. Let's create a function to get the instance.
-let groqInstance = null;
-const getGroq = () => {
-    if (!groqInstance) {
-        groqInstance = new Groq({
-            apiKey: process.env.GROQ_API_KEY || "dummy", 
-        });
-    }
-    return groqInstance;
-};
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // @desc    Chat with AI and save to DB
 // @route   POST /api/ai/chat
 export const chatWithAI = async (req, res) => {
   try {
+    console.log('chatWithAI called with body:', req.body);
     const { message } = req.body;
 
     if (!message || typeof message !== 'string' || message.trim() === '') {
         return res.status(400).json({ error: "Message is required and must be a string." });
     }
 
-    if (!process.env.GROQ_API_KEY) {
-        return res.status(500).json({ error: "GROQ_API_KEY environment variable is not set." });
-    }
+    // The GROQ_API_KEY is loaded via dotenv at startup. The lazy Groq initializer will throw if missing.
+    // No need for a separate environment variable check here.
 
-    const groq = getGroq();
+    // Diagnostic key length
+console.log('GROQ_API_KEY length at request:', (process.env.GROQ_API_KEY || '').length);
+    // groq client already initialized
+    // Using the initialized groq client
     const response = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+      model: "qwen/qwen3.8-27b",
       messages: [
         { role: "user", content: message }
       ]
@@ -54,10 +49,15 @@ export const chatWithAI = async (req, res) => {
     });
 
   } catch (error) {
-    console.error("AI Route Error:", error);
-    res.status(500).json({ 
-        error: "AI error", 
-        details: error.message || "Unknown error occurred" 
+    // Log detailed Groq API error without leaking secrets
+    const status = error?.response?.status ?? 500;
+    const providerMessage = error?.response?.data?.error?.message || error.message || 'Unknown error';
+    const providerCode = error?.response?.data?.error?.code || null;
+    console.error('AI Route Error:', { status, providerMessage, providerCode });
+    res.status(status).json({
+      error: 'AI service error',
+      details: providerMessage,
+      code: providerCode,
     });
   }
 };
